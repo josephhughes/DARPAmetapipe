@@ -1,7 +1,8 @@
 # DARPAmetapipe
 
 This code is adapted from https://github.com/mvvucak/LASV_Sample_Classification
-The collection of scripts and snakemake pipelines are used to process Illumina reads from the multimammate rodent (Mastomys species) into taxonomically classified contigs. 
+
+The collection of scripts and snakemake pipelines are used to process Illumina reads from the multimammate rodent (_Mastomys species_) into taxonomically classified contigs. 
 In this case, the pipeline was used to identify all herpesvirus, mammarenavirus, arenaviridae, herpesvirales and adenoviridae sequences present in samples.
 
 ## Dependencies
@@ -91,6 +92,8 @@ This Snakefile classifies contigs from the de novo assembly through several step
    - BLASTX using Diamond v.2.0.9 against a Diamond2 database including all RefSeq Proteins and their taxonomy information
    - Custom Python scripts to match each contig to the Lowest Common Ancestor of all its BLASTx hits.
    - Custom Python scripts to identify and extract contigs matching a target taxon (e.g. all contigs with arenavirus hits)
+
+The diamond snakemake rule will load specific dependencies needed for it to work.
 
 Run with `snakemake --snakefile Snakediamond -j {threads}`
 
