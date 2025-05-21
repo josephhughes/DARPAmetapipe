@@ -1,0 +1,304 @@
+configfile: "config.yml"
+
+# De novo assembly pipeline. Runs metaSPAdes on processed reads: either 
+# host depleted reads (DNA datasets) or rRNA depleted reads (RNA datasets).
+# Once de novo is complete, it compiles basic assembly statistics such as
+# the N50 for each assembly. It also maps the reads used in assembly onto
+# the output contigs and calculates what % of reads map successfuly for each
+# sample. This serves as a sanity check to detect assembly problems.
+
+
+rule all:
+    input:
+        expand("Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta", sample = config["all_samples"]),
+        "Assemblies/Spades/host_depleted_alignment_stats.tsv",
+        "Assemblies/Spades/Host_Depleted/assembly_stats.tsv"
+
+# Run metaSPAdes on host depleted reads for a given sample.
+rule spades:
+    input:
+        reads_1 = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_R1.", config["trimmed_reads_format"]]),
+        reads_2 = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_R2.", config["trimmed_reads_format"]]),
+        reads_singleton = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_Singletons.", config["trimmed_reads_format"]]),
+    output:
+        "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    params:
+        out_dir = "Assemblies/Spades/Host_Depleted/{sample}"
+    threads: 8
+    shell:
+        "spades.py --meta -t {threads} -1 {input.reads_1} -2 {input.reads_2} -s {input.reads_singleton} -m 600 -o {params.out_dir}"
+
+
+# Compile basic assembly stats for a given sample
+rule collect_assembly_stats:
+    input:
+        contigs = "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        stats = "Assemblies/Spades/Host_Depleted/{sample}/assembly_stats.tsv"
+    params:
+        tiny_contig_threshold = 1000
+    threads: 1
+    run:
+        from Bio import SeqIO
+        import pandas as pd
+        from statistics import median
+        import numpy as np
+
+        contigs = [rec for rec in SeqIO.parse(input.contigs, "fasta")]
+
+        contig_stats_dict = {}
+
+        contig_stats_dict["Sample"] = wildcards.sample
+
+        contig_stats_dict["Number of Contigs"] = len(contigs)
+
+        # Calculate proportion of very small contigs present (arbitrary cut-off)
+        num_tiny_contigs = len([contig for contig in contigs if len(contig.seq)<=params.tiny_contig_threshold])
+        contig_stats_dict["Percent Tiny Contigs"] = num_tiny_contigs/contig_stats_dict["Number of Contigs"]*100
+
+        def calculate_NX_for_assembly(x):
+            # Sort contigs by length, descending
+            descending_contig_lengths = sorted([len(contig.seq) for contig in contigs], reverse= True)
+            # Get ndarray of cumulative lengths for contigs.
+            cumulative_lengths = np.cumsum(descending_contig_lengths)
+
+            # Calculate length of assembly at desired NX value
+            # e.g. for N50 it's at 0.5 the assembly length i.e. mid-length. For N90 it's at 0.9 the length
+            assembly_n_length = int(sum(descending_contig_lengths)*(x/100))
+            # Use n-length to find first contig that goes above it
+            first_cumulative_length_above_n_length = min(cumulative_lengths[cumulative_lengths >= assembly_n_length])
+            index_of_nx_contig = int(np.where(cumulative_lengths == first_cumulative_length_above_n_length)[0])
+            nx = descending_contig_lengths[index_of_nx_contig]
+            return nx
+
+        def calculate_NX_for_assembly_without_tiny_contigs(x):
+            contigs_except_tiny_contigs = [contig for contig in contigs if len(contig.seq)>params.tiny_contig_threshold]
+            # Sort contigs by length, descending
+            descending_contig_lengths = sorted([len(contig.seq) for contig in contigs_except_tiny_contigs], reverse= True)
+            # Get ndarray of cumulative lengths for contigs.
+            cumulative_lengths = np.cumsum(descending_contig_lengths)
+
+            # Calculate length of assembly at desired NX value
+            # e.g. for N50 it's at 0.5 the assembly length i.e. mid-length. For N90 it's at 0.9 the length
+            assembly_n_length = int(sum(descending_contig_lengths)*(x/100))
+            # Use n-length to find first contig that goes above it
+            first_cumulative_length_above_n_length = min(cumulative_lengths[cumulative_lengths >= assembly_n_length])
+            index_of_nx_contig = int(np.where(cumulative_lengths == first_cumulative_length_above_n_length)[0])
+            nx = descending_contig_lengths[index_of_nx_contig]
+            return nx
+
+        # Calculate N50 for assembly
+        contig_stats_dict["N50"] = calculate_NX_for_assembly(50)
+        # Calculate N90 for assembly
+        contig_stats_dict["N90"] = calculate_NX_for_assembly(90)
+
+        # Calculate N50 for assembly without tiny contigs (usually <1000bp long)
+        contig_stats_dict["N50_no_tiny"] = calculate_NX_for_assembly_without_tiny_contigs(50)
+        # Calculate N90 for assembly without tiny contigs (usually <1000bp long)
+        contig_stats_dict["N90_no_tiny"] = calculate_NX_for_assembly_without_tiny_contigs(90)
+
+        # Find median contig length, ignoring very small contigs.
+        contig_stats_dict["Median Contig Length"] = median([len(contig.seq) for contig in contigs if len(contig.seq)>params.tiny_contig_threshold])
+        # Find maximum contig length, ignoring very small contigs.
+        contig_stats_dict["Maximum Contig Length"] = max([len(contig.seq) for contig in contigs if len(contig.seq)>params.tiny_contig_threshold])
+
+        contig_stats_df = pd.DataFrame(data = contig_stats_dict, index = [wildcards.sample])
+
+        contig_stats_df.to_csv(output.stats, sep = '\t')
+
+
+# Compile all assembly stats into one .tsv file.
+rule aggregate_assembly_stats_across_samples:
+    input:
+        stats_files = expand("Assemblies/Spades/Host_Depleted/{sample}/assembly_stats.tsv", sample = config["all_samples"])
+    output:
+        aggregate_stats = "Assemblies/Spades/Host_Depleted/assembly_stats.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+
+        overall_df = None 
+
+        for file in input.stats_files:
+            file_df = pd.read_csv(file, sep = '\t', header = 0, index_col=0)
+            print(file_df)
+            if overall_df is None:
+                overall_df = file_df 
+            else:
+                overall_df = overall_df.append(file_df)
+
+        overall_df.to_csv(output.aggregate_stats, sep = '\t')
+
+
+#########################################
+############ Mapping Metrics ############
+#########################################
+
+
+# Create Bowtie2 index for all contigs for a given sample.
+rule bowtie2_index_contigs:
+    input:
+        contigs = "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        ref_index = expand("Assemblies/Spades/Host_Depleted/{{sample}}/contigs.fasta.{extension}", extension = config["bowtie2_index_extensions"])
+    threads: 8
+    shell:
+        "bowtie2-build --threads {threads} {input.contigs} {input.contigs}"
+
+# Map PAIREd host depleted reads onto the de novo contigs for a given sample
+# Limitatin of Bowtie2: it cannot map paired (2 files) and singleton (1 file)
+# reads onto a reference in the same call.
+rule bowtie2_map_paired_host_depleted_reads_onto_contigs:
+    input:
+        contigs = "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta",
+        ref_index = expand("Assemblies/Spades/Host_Depleted/{{sample}}/contigs.fasta.{extension}", extension = config["bowtie2_index_extensions"]),
+        reads_1 = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_R1.", config["trimmed_reads_format"]]),
+        reads_2 = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_R2.", config["trimmed_reads_format"]])
+    output:
+        sam_file = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_paired_onto_contigs.sam"
+    threads: 6
+    shell:
+        "bowtie2 -x {input.contigs} -1 {input.reads_1} -2 {input.reads_2} -S {output.sam_file} --threads {threads}" 
+
+
+# Map SINGLETON host depleted reads onto the de novo contigs for a given sample
+# Limitation of Bowtie2: it cannot map paired (2 files) and singleton (1 file)
+# reads onto a reference in the same call. Singleton reads are those whose
+# paired read was filtered out during host depletion.
+rule bowtie2_map_singleton_host_depleted_reads_onto_contigs:
+    input:
+        contigs = "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta",
+        ref_index = expand("Assemblies/Spades/Host_Depleted/{{sample}}/contigs.fasta.{extension}", extension = config["bowtie2_index_extensions"]),
+        reads_singleton = "".join(["Reads/Host_Depleted/mastomys_coucha_scaffold/{sample}_host_depleted_Singletons.", config["trimmed_reads_format"]])
+    output:
+        sam_file = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_singleton_onto_contigs.sam"
+    threads: 6
+    shell:
+        "bowtie2 -x {input.contigs} -r {input.reads_singleton} -S {output.sam_file} --threads {threads}" 
+
+
+# Compress output .sam files for a given sample.
+rule convert_sam_to_bam:
+    input:
+        sam = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_{pair_type}_onto_contigs.sam"
+    output:
+        bam = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_{pair_type}_onto_contigs.bam"
+    threads: 1
+    shell:
+        """
+        samtools view -S -b {input.sam} | samtools sort -o {output.bam}
+        samtools index {output.bam}
+        rm -f {input.sam}
+        """
+
+# Count number of mapped and unmapped reads in a contig alignment for a 
+# given sample. Handles both paired and singleton read alignments.
+# Calculates the % of reads that mapped for each type (paird, singleton)
+# as well as % of total reads mapped. Also calculates singleton reads as 
+# a % of total reads.
+rule count_mapped_and_unmapped_reads_for_each_sample:
+    input:
+        paired_aln = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_paired_onto_contigs.bam",
+        singleton_aln = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_singleton_onto_contigs.bam"
+    output:
+        read_stats = "Alignments/Spades/Host_Depleted/{sample}_host_depleted_alignment_stats.tsv"
+    threads: 1
+    run:
+        import subprocess
+        import pandas as pd 
+
+        # Counts all mapped (-F4) reads in a given .bam file.
+        def count_mapped_reads(bam_file):
+            count_command = ["samtools", "view", "-c", "-F4", bam_file]
+
+            samtools_count = subprocess.Popen(count_command, shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+
+            # Grab results and decode from binary
+            mapped_read_count = samtools_count.communicate()[0].decode().rstrip() # Removes last newline
+            print(mapped_read_count)
+            mapped_read_count = int(mapped_read_count)
+            return mapped_read_count
+
+         # Counts all unmapped (-f4) reads in a given .bam file.
+        def count_unmapped_reads(bam_file):
+            count_command = ["samtools", "view", "-c", "-f4", bam_file]
+
+            samtools_count = subprocess.Popen(count_command, shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+
+            # Grab results and decode from binary
+            unmapped_read_count = samtools_count.communicate()[0].decode().rstrip() # Removes last newline
+            unmapped_read_count = int(unmapped_read_count)
+            return unmapped_read_count
+
+        # Counts total number of reads in a list of bam_files.
+        def count_total_reads(bam_files):
+            total_reads = 0
+            for bam_file in bam_files:
+                count_command = ["samtools", "view", "-c", bam_file]
+    
+                samtools_count = subprocess.Popen(count_command, shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+    
+                # Grab results and decode from binary
+                total_read_count = samtools_count.communicate()[0].decode().rstrip() # Removes last newline
+                total_read_count = int(total_read_count)
+
+                total_reads += total_read_count
+
+            return total_reads
+
+
+        # Calculates % of reads that are mapped for a list of bam_files
+        def get_percentage_mapped_reads(bam_files):
+            mapped_reads = 0
+            unmapped_reads = 0
+
+            for bam_file in bam_files:
+                mapped_reads += count_mapped_reads(bam_file)
+                unmapped_reads += count_unmapped_reads(bam_file)
+
+            total_reads = mapped_reads + unmapped_reads
+            percentage_mapped_reads = mapped_reads/total_reads*100
+
+            return percentage_mapped_reads
+
+
+        percentage_mapped_paired_reads = get_percentage_mapped_reads([input.paired_aln])
+
+        percentage_mapped_singleton_reads = get_percentage_mapped_reads([input.singleton_aln])
+
+        percentage_mapped_total_reads = get_percentage_mapped_reads([input.paired_aln, input.singleton_aln])
+
+        percentage_singleton_reads = (count_total_reads([input.singleton_aln])/count_total_reads([input.singleton_aln, input.paired_aln]))*100
+
+        df_dict = {}
+        df_dict["Sample"] = [wildcards.sample]
+        df_dict["Percentage Mapped Paired Reads"] = percentage_mapped_paired_reads
+        df_dict["Percentage Mapped Singleton Reads"] = percentage_mapped_singleton_reads
+        df_dict["Percentage Mapped Total Reads"] = percentage_mapped_total_reads
+        df_dict["Percentage Singleton Reads"] = percentage_singleton_reads
+
+        sample_df = pd.DataFrame(data=df_dict).set_index("Sample")
+        sample_df.to_csv(output.read_stats, sep = '\t')
+
+
+# Compiles contig-mapping statistics into one .tsv file.
+rule aggregate_host_depleted_alignment_stats_across_samples:
+    input:
+        mapping_stats_files = expand("Alignments/Spades/Host_Depleted/{sample}_host_depleted_alignment_stats.tsv", sample = config["all_samples"])
+    output:
+        aggregate_stats = "Assemblies/Spades/host_depleted_alignment_stats.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+
+        overall_df = None 
+
+        for file in input.mapping_stats_files:
+            file_df = pd.read_csv(file, sep = '\t', header = 0, index_col=0)
+            print(file_df)
+            if overall_df is None:
+                overall_df = file_df 
+            else:
+                overall_df = overall_df.append(file_df)
+
+        overall_df.to_csv(output.aggregate_stats, sep = '\t')

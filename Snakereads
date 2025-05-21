@@ -1,0 +1,297 @@
+configfile: "config.yml"
+
+# Read processing pipeline. Takes raw reads and performs adapter and
+# quality trimming, followed by basic deduplication using fastuniq.
+# Counts the number of reads at each stage and produces an output report.
+
+rule all:
+    input:
+        "Reads/Read_Processing_Summary.tsv",
+
+# Counts raw reads in each file.
+rule count_raw_reads:
+    input:
+        reads_1 = "".join(["Reads/Raw/{sample}_R1_001.", config["compressed_raw_reads_format"]]),
+        reads_2 = "".join(["Reads/Raw/{sample}_R2_001.", config["compressed_raw_reads_format"]])
+    output:
+        temp("Reads/Raw/{sample}_raw_read_counts.tsv")
+    threads: 1
+    run:
+        import pandas as pd 
+        import subprocess
+
+        raw_reads = 0
+        for reads_file in [input.reads_1, input.reads_2]:
+            zcat_file = subprocess.Popen(["zcat", reads_file], shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+            count_lines = subprocess.Popen(["wc", "-l"], shell = False, stdin = zcat_file.stdout, stdout = subprocess.PIPE)
+
+            # Grab results and decode from binary
+            line_count = count_lines.communicate()[0].decode().rstrip() # Removes last newline
+
+            line_count = re.split(" ", line_count)[0] # Grab number, removing file name from wc command output
+
+            read_count = int(line_count)/4 # Each fastq record is 4 lines, so divide by 4 for number of reads.
+
+            raw_reads += int(read_count)
+
+        reads_df = pd.DataFrame(data = {"Raw Reads": raw_reads}, index = [wildcards.sample])
+        reads_df.to_csv(output[0], sep = "\t")
+
+
+# Aggregates raw read counts for all samples into one .tsv file.
+rule aggregate_raw_read_counts:
+    input:
+        expand("Reads/Raw/{sample}_raw_read_counts.tsv", sample = config["all_samples"])
+    output:
+        "Reads/Raw/aggregate_raw_read_counts.tsv"
+    threads: 1
+    run: 
+        import pandas as pd 
+
+        overall_counts_df = None 
+        for reads_count in input:
+            reads_count_df = pd.read_csv(reads_count, sep = '\t')
+            print(reads_count_df)
+            if overall_counts_df is None:
+                overall_counts_df = reads_count_df
+            else:
+                overall_counts_df = overall_counts_df.append(reads_count_df)
+        print(overall_counts_df)
+
+        overall_counts_df.to_csv(output[0], sep = '\t', index = False)
+
+# Performs read trimming with trim_galore. This removes adapter
+# sequences (using automatic detection) and any reads with average Q 
+# scores below the threshold as well as reads that become shorter than
+# a minimum length after trimming. Note that trim_galore uses 2 threads
+# without telling you, hence threads: 2.
+rule trim_reads:
+    input:
+        "".join(["Reads/Raw/{sample}_R1_001.", config["compressed_raw_reads_format"]]),
+        "".join(["Reads/Raw/{sample}_R2_001.", config["compressed_raw_reads_format"]])
+    output:
+        "".join(["Reads/Trimmed/{sample}_R1_001_val_1.", config["trimmed_reads_format"]]),
+        "".join(["Reads/Trimmed/{sample}_R2_001_val_2.", config["trimmed_reads_format"]])
+    threads: 2
+    params:
+        trimmed_reads_dir = "Reads/Trimmed",
+        quality_threshold = 25,
+        minimum_length = 50
+    shell:
+        "trim_galore -q {params.quality_threshold} --length {params.minimum_length} --paired --output_dir {params.trimmed_reads_dir} {input}"
+
+
+# Counts trimmed reads in each file.
+rule count_trimmed_reads:
+    input:
+        reads_1 = "".join(["Reads/Trimmed/{sample}_R1_001_val_1.", config["trimmed_reads_format"]]),
+        reads_2 = "".join(["Reads/Trimmed/{sample}_R2_001_val_2.", config["trimmed_reads_format"]])
+    output:
+        "Reads/Trimmed/{sample}_trimmed_read_counts.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+        import subprocess
+
+        trimmed_reads = 0
+        for reads_file in [input.reads_1, input.reads_2]:
+            zcat_file = subprocess.Popen(["zcat", reads_file], shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+            count_lines = subprocess.Popen(["wc", "-l"], shell = False, stdin = zcat_file.stdout, stdout = subprocess.PIPE)
+
+            # Grab results and decode from binary
+            line_count = count_lines.communicate()[0].decode().rstrip() # Removes last newline
+
+            line_count = re.split(" ", line_count)[0] # Grab number, removing file name from wc command output
+
+            read_count = int(line_count)/4 # Each fastq record is 4 lines, so divide by 4 for number of reads.
+
+            trimmed_reads += int(read_count)
+
+        reads_df = pd.DataFrame(data = {"Trimmed Reads": trimmed_reads}, index = [wildcards.sample])
+        reads_df.to_csv(output[0], sep = "\t")
+
+
+# Aggregates trimmed read counts for all samples into one .tsv file.
+rule aggregate_trimmed_read_counts:
+    input:
+        expand("Reads/Trimmed/{sample}_trimmed_read_counts.tsv", sample = config["all_samples"])
+    output:
+        "Reads/Trimmed/aggregate_trimmed_read_counts.tsv"
+    threads: 1
+    run: 
+        import pandas as pd 
+
+        overall_counts_df = None 
+        for reads_count in input:
+            reads_count_df = pd.read_csv(reads_count, sep = '\t')
+            print(reads_count_df)
+            if overall_counts_df is None:
+                overall_counts_df = reads_count_df
+            else:
+                overall_counts_df = overall_counts_df.append(reads_count_df)
+        print(overall_counts_df)
+
+        overall_counts_df.to_csv(output[0], sep = '\t', index = False)
+
+# Unzips gzipped trimmed read files. Necessary because fastuniq does not
+# accept gzipped files... Unzipped files are stored separately for simpler
+# removal later; unzipping and rezipping the same file makes Snakemake throw a fit.
+rule unzip_for_deduplication:
+    input:
+        "".join(["Reads/Trimmed/{sample}_R1_001_val_1.", config["trimmed_reads_format"]]),
+        "".join(["Reads/Trimmed/{sample}_R2_001_val_2.", config["trimmed_reads_format"]])
+    output:
+        "Reads/Trimmed/{sample}_R1_001_val_1.fq",
+        "Reads/Trimmed/{sample}_R2_001_val_2.fq"
+    threads: 1
+    shell:
+        """
+        gunzip -c {input[0]} > {output[0]}
+        gunzip -c {input[1]} > {output[1]}
+        """
+
+# Fastuniq requires a simple file naming each read file to be processed.
+# This step creates it.
+rule create_deduplication_reads_file:
+    input:
+        expand("Reads/Trimmed/{{sample}}_R{num}_001_val_{num}.fq", num=[1,2])
+    output:
+        "Reads/Deduplicated/{sample}.txt"
+    threads: 1
+    shell:
+        """
+        echo {input[0]} > {output}
+        echo {input[1]} >> {output}
+        """
+
+# Deduplicate reads with fastuniq. This is non-reference based deduplication.
+# It only removes exact duplicate reads and outputs unzipped .fastq files.
+rule deduplicate_reads:
+    input:
+        expand("Reads/Trimmed/{{sample}}_R{num}_001_val_{num}.fq", num=[1,2]),
+        "Reads/Deduplicated/{sample}.txt"
+    output:
+        "Reads/Deduplicated/{sample}_R1_dedup.fq",
+        "Reads/Deduplicated/{sample}_R2_dedup.fq"
+    threads: 1
+    shell:
+        """
+        fastuniq -i {input[2]} -t q -o {output[0]} -p {output[1]}
+        """
+
+# Gzip fastuniq output and remove the unzipped trimmed reads as they are
+# no longer needed.
+rule zip_deduplicated_reads_and_remove_uncompressed_trimmed_reads:
+    input:
+        "Reads/Deduplicated/{sample}_R1_dedup.fq",
+        "Reads/Deduplicated/{sample}_R2_dedup.fq",
+        expand("Reads/Trimmed/{{sample}}_R{num}_001_val_{num}.fq", num=[1,2])
+    output:
+        "".join(["Reads/Deduplicated/{sample}_R1_dedup.", config["trimmed_reads_format"]]),
+        "".join(["Reads/Deduplicated/{sample}_R2_dedup.", config["trimmed_reads_format"]])
+    shell:
+        """
+        gzip {input[0]}
+        gzip {input[1]}
+        rm -f {input[2]}
+        rm -f {input[3]}
+        """
+
+# Counts deduplicated reads in each file.
+rule count_deduplicated_reads:
+    input:
+        reads_1 = "".join(["Reads/Deduplicated/{sample}_R1_dedup.", config["trimmed_reads_format"]]),
+        reads_2 = "".join(["Reads/Deduplicated/{sample}_R2_dedup.", config["trimmed_reads_format"]])
+    output:
+        "Reads/Deduplicated/{sample}_deduplicated_read_counts.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+        import subprocess
+
+        dedup_reads = 0
+        for reads_file in [input.reads_1, input.reads_2]:
+            zcat_file = subprocess.Popen(["zcat", reads_file], shell = False, stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+            count_lines = subprocess.Popen(["wc", "-l"], shell = False, stdin = zcat_file.stdout, stdout = subprocess.PIPE)
+
+            # Grab results and decode from binary
+            line_count = count_lines.communicate()[0].decode().rstrip() # Removes last newline
+
+            line_count = re.split(" ", line_count)[0] # Grab number, removing file name from wc command output
+
+            read_count = int(line_count)/4 # Each fastq record is 4 lines, so divide by 4 for number of reads.
+
+            dedup_reads += int(read_count)
+
+        reads_df = pd.DataFrame(data = {"Deduplicated Reads": dedup_reads}, index = [wildcards.sample])
+        reads_df.to_csv(output[0], sep = "\t")
+
+
+# Aggregates deduplicated read counts for all samples into one .tsv file.
+rule aggregate_deduplicated_read_counts_across_samples:
+    input:
+        expand("Reads/Deduplicated/{sample}_deduplicated_read_counts.tsv", sample = config["all_samples"])
+    output:
+        "Reads/Deduplicated/aggregate_deduplicated_read_counts.tsv"
+    threads: 1
+    run: 
+        import pandas as pd 
+
+        overall_counts_df = None 
+        for reads_count in input:
+            reads_count_df = pd.read_csv(reads_count, sep = '\t')
+            print(reads_count_df)
+            if overall_counts_df is None:
+                overall_counts_df = reads_count_df
+            else:
+                overall_counts_df = overall_counts_df.append(reads_count_df)
+        print(overall_counts_df)
+
+        overall_counts_df.to_csv(output[0], sep = '\t', index = False) 
+
+
+# Compiles read processing report by combining all the read count .tsvs
+# and calculating % duplication for each sample. 
+rule compile_read_processing_summary:
+    input:
+        raw = "Reads/Raw/aggregate_raw_read_counts.tsv",
+        trimmed = "Reads/Trimmed/aggregate_trimmed_read_counts.tsv",
+        deduplicated = "Reads/Deduplicated/aggregate_deduplicated_read_counts.tsv",
+    output:
+        processing_summary = "Reads/Read_Processing_Summary.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+
+        raw_df = pd.read_csv(input.raw, sep = '\t', index_col = False)
+        print(raw_df)
+        trimmed_df = pd.read_csv(input.trimmed, sep = '\t', index_col = False)
+        print(trimmed_df)
+        dedup_df = pd.read_csv(input.deduplicated, sep = '\t', index_col = False)
+
+        raw_trim_df = pd.merge(raw_df, trimmed_df, how = "inner")
+        print(raw_trim_df)
+        full_df = pd.merge(raw_trim_df, dedup_df, how = "inner")
+        print(full_df)
+
+        full_df.rename(columns = {full_df.columns[0]:"Sample"}, inplace = True)
+
+        full_df["Duplication Rate"] = ((full_df["Trimmed Reads"] - full_df["Deduplicated Reads"])/full_df["Trimmed Reads"])*100
+
+
+        full_df.to_csv(output.processing_summary, sep = '\t', index = False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

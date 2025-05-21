@@ -1,0 +1,405 @@
+configfile: "config.yml"
+
+
+# Metagnomic/classification pipeline. Runs BLASTx on contigs anduses the 
+# taxonomic identity of any hits to assign a taxon identity to each contig.
+# Extracts any contigs matching taxa specified in config.yml: most importantly,
+# herpesvirus and arenavirus contigs.
+# Additionally, BLASTs all herpesvrus contigs
+
+
+rule all:
+    input:
+        expand("Contigs/Host_Depleted/{taxon}/{taxon}_all_samples_stats.tsv", taxon = config["target_taxons"]),
+        # expand("Contigs/Host_Depleted/All/{sample}_contigs_all.fasta", sample = config["all_samples"]),
+        expand("Contigs/Host_Depleted/Herpesvirus_DPOL/{sample}_herpesvirus_dna_polymerase_contigs.fasta", sample = config["all_samples"]),
+        expand("Contigs/Host_Depleted/Allcontigs/{sample}_contigs.fasta", sample = config["all_samples"]),
+        "Contigs/Host_Depleted/Herpesvirus_DPOL/BLASTx/herpesvirus_dpol_contigs.csv"
+
+######################################################################################
+#########################  Contig Taxonomic Classificaton  ###########################
+######################################################################################
+
+# Places all de novo contigs for each sample in a single directory
+# for easier manual inspection.
+rule extract_and_rename_all_contigs_for_sample:
+    input:
+        "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        "Contigs/Host_Depleted/{sample}_contigs_all.fasta"
+    threads: 1
+    shell:
+        "cp {input} {output}"
+
+
+# Runs Diamond BLASTx on all de novo contigs for a given sample
+# aligning them to all RefSeq protein sequences.
+rule run_diamond_on_contigs:
+    input:
+        "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        "Diamond/Assemblies/Host_Depleted/{sample}_contigs_diamond.m8"
+    threads: 16
+    conda:
+        "Environments/diamond.yml"
+    params:
+        diamond_db = "/home2/mvv1e/Databases/RefSeq_Protein.dmnd",
+        diamond_block_size = 12,
+        diamond_index_chunks = 1,
+        diamond_tabular_format = "qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore staxids sscinames sskingdoms skingdoms"
+    shell:
+        "diamond blastx -d {params.diamond_db} -p {threads} -b {params.diamond_block_size} -c {params.diamond_index_chunks} -q {input} -o {output} --top 1 -f 6 {params.diamond_tabular_format}"
+
+rule organise_all_contigs:
+    input:
+        "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        "Contigs/Host_Depleted/Allcontigs/{sample}_contigs.fasta"
+    shell:
+        "cp {input} {output}"
+
+# Aggregates Diamond hit TaxIDs for each contig into a single value (a list)
+# This collapses all contigs to just one row, rather than one row per hit.
+rule collapse_taxids_for_each_contig:
+    input:
+        "Diamond/Assemblies/Host_Depleted/{sample}_contigs_diamond.m8"
+    output:
+        temp("Diamond/Assemblies/Host_Depleted/{sample}_diamond_taxids_by_contig.tsv")
+    threads: 1
+    run:
+        import pandas as pd 
+
+        # Field names for dataframe.
+        col_names = ["Contig", "Identity", "Evalue", "Diamond Hit TaxID"]
+
+        # Diamond .m8 columns to keep. Correspond to col_names
+        cols_to_use = [0, 2, 10, 12]
+
+        # Read in .tsv using above field names. Ensure TaxID is read in as a string rather than an int
+        diamond_df = pd.read_csv(input[0], sep = '\t', usecols = cols_to_use, names = col_names, dtype = {"Diamond Hit TaxID":str})
+
+        # Get boolean array of all contigs where True means there is no TaxID for the hit.
+        no_taxid_mask = diamond_df["Diamond Hit TaxID"].isna()
+
+        # Remove all entries without a taxID for the hit.
+        filtered_df = diamond_df.loc[~no_taxid_mask]
+
+        # Group fields by contig name, then join separate TaxID entries for each contig.
+        taxid_collapsed_df = filtered_df.groupby("Contig")["Diamond Hit TaxID"].apply(" ".join).reset_index()
+
+
+        # Write datarame with collapsed TaxID fields to file.
+        taxid_collapsed_df.to_csv(output[0], sep = '\t', index = False)
+
+# Assigns taxonomic classifications to each contig based on the taxIDs of
+# its BLASTx hits. Outputs a .tsv file where each Contig is a row and
+# columns list the: 
+# 1: TaxIDs of all its Diamond hits (1+ values)
+# 2: TaxID of the LCA of its Diamond hits (1 value)
+# 3: TaxID of each taxon the LCA belongs to (1 value)
+# The last can be multiple columns, each corresponding to a specific taxon
+# rank (genus, order etc.). The exact ranks included are determined by
+# params.ranks (either from config file or superkingdom only by default).
+rule get_taxonomy_info_for_each_contig:
+    input:
+        "Diamond/Assemblies/Host_Depleted/{sample}_diamond_taxids_by_contig.tsv"
+    output:
+        "Diamond/Assemblies/Host_Depleted/{sample}_contigs_taxonomy_info.tsv"
+    threads: 1
+    params:
+        script = "Scripts/get_tax_ranks.py",
+        ranks = " ".join(config.get("tax_ranks", ["superkingdom"]))
+    shell:
+        "python3 {params.script} -i {input} -o {output} -r {params.ranks}"
+
+# Extracts rows for each contig belonging to specified taxon.
+rule subset_contigs_list_by_taxon:
+    input:
+        "Diamond/Assemblies/Host_Depleted/{sample}_contigs_taxonomy_info.tsv"
+    output:
+        temp("Contigs/Host_Depleted/{taxon}/{sample}_{taxon}_contigs_list.tsv")
+    threads: 1
+    run:
+        import pandas as pd 
+
+        # Read in dataframe containing taxonomy information for all contigs.
+        contig_df = pd.read_csv(input[0], sep = '\t', index_col = 0)
+
+        # Retrieve taxonomic rank of target taxon.
+        taxon_rank = config["target_taxons"][wildcards.taxon]["rank"]
+
+        # Retrieve taxid of target taxon.
+        taxon_id = config["target_taxons"][wildcards.taxon]["taxid"]
+
+        # Filter for contigs of desired taxon (i.e. target taxid in target rank).
+        taxon_mask = contig_df.loc[:,taxon_rank] == taxon_id
+        taxon_subset_df = contig_df.loc[taxon_mask]
+
+        taxon_subset_df.to_csv(output[0], sep = '\t')
+
+
+# Extracts contigs belonging to a specified taxon from the original
+# contigs.fasta output by SPAdes and stores them in a directory
+# corresponding to the specified contig.
+checkpoint extract_contigs_by_taxon:
+    input:
+        contigs_list =  "Contigs/Host_Depleted/{taxon}/{sample}_{taxon}_contigs_list.tsv",
+        all_contigs = "Assemblies/Spades/Host_Depleted/{sample}/contigs.fasta"
+    output:
+        taxon_contigs = "Contigs/Host_Depleted/{taxon}/{sample}_{taxon}_contigs.fasta"
+    threads: 1
+    run:
+        from Bio import SeqIO
+        import pandas as pd 
+
+        contigs_df = pd.read_csv(input.contigs_list, sep = '\t')
+
+        contig_names = contigs_df.loc[:,"Contig"].tolist()
+
+        taxon_contigs = []
+
+        for rec in SeqIO.parse(input.all_contigs, "fasta"):
+            if rec.id in contig_names:
+                taxon_contigs.append(rec)
+
+        SeqIO.write(taxon_contigs, output.taxon_contigs, "fasta-2line")
+
+# For a given sample, outputs a .tsv file with basic stats for all contigs
+# classified as belonging to a specific taxon. Includes total number of
+# such contigs, median and maximum length and % below 1000nt.
+rule summarize_contigs_by_taxon:
+    input:
+        taxon_contigs = "Contigs/Host_Depleted/{taxon}/{sample}_{taxon}_contigs.fasta"
+    output:
+        contigs_summary = temp("Contigs/Host_Depleted/{taxon}/{sample}_{taxon}_contig_stats.tsv")
+    threads: 1
+    run: 
+        from Bio import SeqIO
+        import pandas as pd
+        from numpy import median
+
+        contigs = []
+        for rec in SeqIO.parse(input.taxon_contigs, "fasta-2line"):
+            contigs.append(rec) 
+
+        contig_data = {}
+
+        if len(contigs) == 0:
+            contig_data["num_contigs"] = 0
+            contig_data["max_length"] = 0
+            contig_data["median_length"] = 0
+            contig_data["percent_tiny_contigs"] = 0
+        else:
+            contig_data["num_contigs"] = len(contigs)   
+            contig_data["max_length"] = max([len(contig.seq) for contig in contigs])
+            contig_data["median_length"] = median([len(contig.seq) for contig in contigs])
+            contig_data["percent_tiny_contigs"] = len([contig for contig in contigs if len(contig.seq) < 1000])/contig_data["num_contigs"]*100
+
+        contig_df = pd.DataFrame(contig_data, index = [wildcards.sample])
+
+        print(contig_df)
+        
+        contig_df.to_csv(output.contigs_summary, sep = '\t')
+
+# For a specified taxon, aggregates contig stats across all samples.
+rule aggregate_taxon_contig_summaries_across_samples:
+    input:
+        expand("Contigs/Host_Depleted/{{taxon}}/{sample}_{{taxon}}_contig_stats.tsv", sample = config["all_samples"])
+    output:
+        taxon_summary = "Contigs/Host_Depleted/{taxon}/{taxon}_all_samples_stats.tsv"
+    threads: 1
+    run:
+        import pandas as pd 
+        overall_df = None 
+
+        for file in input:
+            file_df = pd.read_csv(file, sep = '\t', index_col = 0)
+
+
+            if overall_df is None:
+                overall_df = file_df 
+            else:
+                overall_df = overall_df.append(file_df)
+
+        overall_df.to_csv(output.taxon_summary, sep = '\t')
+
+
+#####################################################################################
+########################  Herpesvirus DNA Polymerase BLASTx  ########################
+#####################################################################################
+
+
+# Takes contigs classified as herpesvirus for a given sample and performs
+# Diamond BLASTx against the DNA polymerase reference sequences.
+# Outputs tabular BLAST .tsv file for each hit.
+rule blastx_contigs_vs_polymerase_seqs_with_diamond:
+    input:
+        contigs = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta"
+    output:
+        blast_out =  temp("Contigs/Host_Depleted/Herpesvirus_DPOL/Present/BLASTx/{sample}_herpesvirus_dpol_headerless.out")
+    params:
+        polymerase_db = config["herpesvirus_DNA_polymerases_db"],
+        diamond_block_size = 12,
+        diamond_index_chunks = 1,
+        diamond_tabular_format = "qseqid\tsseqid\tpident\tlength\tqlen\tevalue\tbitscore",
+    threads: 4
+    shell:
+        "diamond blastx -d {params.polymerase_db} -p {threads} -b {params.diamond_block_size} -c {params.diamond_index_chunks} -q {input.contigs} -o {output.blast_out} -k 1 -f 6 {params.diamond_tabular_format}"
+
+
+# Adds column names to DNA PolymeraseBLASTx output.
+rule add_header_to_dna polymerase_blastx_output:
+    input:
+        blast_out = "Contigs/Host_Depleted/Herpesvirus_DPOL/Present/BLASTx/{sample}_herpesvirus_dpol_headerless.out"
+    output:
+        complete_out = temp("Contigs/Host_Depleted/Herpesvirus_DPOL/Present/BLASTx/{sample}_herpesvirus_dpol.csv")
+    threads: 1
+    run:
+        import re
+        import pandas as pd 
+
+        col_names = ["Contig ID", "DPOL Hit", "% Identity", "Alignment Length", "Contig Length", "E-Value", "Bitscore"]
+
+        blast_df = pd.read_csv(input.blast_out, sep = '\t', names = col_names).set_index("Contig ID")
+
+        print(blast_df)
+
+        # Reorder columns.
+        blast_df = blast_df[["Contig Length", "DPOL Hit", "% Identity", "E-Value", "Alignment Length", "Bitscore"]]
+
+        blast_df.to_csv(output.complete_out)
+
+
+# Creates empty BLASTx .csv file for samples lacking herpesviurs contigs.
+rule create_dummy_blastx_csv_file:
+    input:
+        contigs = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta"
+    output:
+        dummy_blast_out = temp("Contigs/Host_Depleted/Herpesvirus_DPOL/Absent/BLASTx/{sample}_herpesvirus_dpol.csv")
+    threads: 1
+    shell:
+        "touch {output.dummy_blast_out}"
+
+
+# For a given sample, checks whether any herpesvirus-like contigs were
+# retrieved. If yes, requests out of DIAMOND BLASTx. If not, requests 
+# dummy file output.
+def get_blastx_csv_file_for_sample(wc):
+    from Bio import SeqIO
+
+    sample = wc.sample 
+
+    herpesvirus_contigs_file = checkpoints.extract_contigs_by_taxon.get(sample = sample, taxon = "herpesvirus").output.taxon_contigs
+    
+    # herpesvirus_contigs_file = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta".format(sample = sample)
+
+    recs = [rec for rec in SeqIO.parse(herpesvirus_contigs_file, "fasta")]
+
+    if len(recs) == 0:
+        return "Contigs/Host_Depleted/Herpesvirus_DPOL/Absent/BLASTx/{sample}_herpesvirus_dpol.csv"
+    else:
+        return "Contigs/Host_Depleted/Herpesvirus_DPOL/Present/BLASTx/{sample}_herpesvirus_dpol.csv"
+
+# Rename BLASTx .csv file so that format is shared between samples with
+# and without herpesvirus-like contigs.
+rule harmonize_herpesvirus_blastx_csv_filenames:
+    input:
+        get_blastx_csv_file_for_sample
+    output:
+        herpesvirus_dpol_contigs_file = "Contigs/Host_Depleted/Herpesvirus_DPOL/BLASTx/{sample}_herpesvirus_dpol.csv"
+    threads: 1
+    shell:
+        "mv {input} {output}"
+
+
+rule aggregate_dna_polymerase_blastx_output_across_samples:
+    input:
+        expand("Contigs/Host_Depleted/Herpesvirus_DPOL/BLASTx/{sample}_herpesvirus_dpol.csv", sample = config["all_samples"])
+    output:
+        dpol_summary = "Contigs/Host_Depleted/Herpesvirus_DPOL/BLASTx/herpesvirus_dpol_contigs.csv"
+    threads: 1
+    run:
+        import pandas as pd
+        import os 
+
+        overall_df = None 
+
+        for file in input:
+
+            try:
+                file_df = pd.read_csv(file, index_col = 0)
+            except pd.errors.EmptyDataError:
+                continue
+
+            if overall_df is None:
+                overall_df = file_df 
+            else:
+                overall_df = overall_df.append(file_df)
+
+        overall_df.to_csv(output.dpol_summary)
+
+
+
+# Extract all contigs with herpesvirus DNA polymerase hits
+# from .fasta file containing herpesvirus contigs.
+rule extract_contigs_with_herpesvirus_dpol_hits:
+    input:
+        blast_out = "Contigs/Host_Depleted/Herpesvirus_DPOL/BLASTx/{sample}_herpesvirus_dpol.csv",
+        contigs = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta"
+    output:
+        contigs_with_dpol_hits = temp("Contigs/Host_Depleted/Herpesvirus_DPOL/Present/{sample}_herpesvirus_dna_polymerase_contigs.fasta")
+    threads: 1
+    run:
+        from Bio import SeqIO
+        import pandas as pd 
+
+        blast_df = pd.read_csv(input.blast_out, header=0)
+
+        recs_to_extract = []
+
+        for rec in SeqIO.parse(input.contigs, "fasta"):
+            if blast_df["Contig ID"].str.contains(rec.id).any():
+                recs_to_extract.append(rec)
+
+        SeqIO.write(recs_to_extract, output.contigs_with_dpol_hits, "fasta")
+
+
+# Create dummy empty .fasta file for a sample without herpesvirus contigs
+rule create_dummy_contigs_with_herpesvirus_dpol_hits:
+    input:
+        taxon_contigs_file = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta"
+    output:
+        empty_contigs_file = temp("Contigs/Host_Depleted/Herpesvirus_DPOL/Absent/{sample}_herpesvirus_dna_polymerase_contigs.fasta")
+    threads: 1
+    shell:
+        "touch {output.empty_contigs_file}"
+
+
+# Returns different target file depending on whether a sample produced 
+# contigs classified as herpesvirus (Present dir) or not (Absent dir)
+def get_dpol_contigs_file(wc):
+    from Bio import SeqIO
+
+    sample = wc.sample 
+
+    herpesvirus_contigs_file = checkpoints.extract_contigs_by_taxon.get(sample = sample, taxon = "herpesvirus").output.taxon_contigs
+
+    # herpesvirus_contigs_file = "Contigs/Host_Depleted/herpesvirus/{sample}_herpesvirus_contigs.fasta".format(sample = sample)
+
+    recs = [rec for rec in SeqIO.parse(herpesvirus_contigs_file, "fasta")]
+
+    if len(recs) == 0:
+        return "Contigs/Host_Depleted/Herpesvirus_DPOL/Absent/{sample}_herpesvirus_dna_polymerase_contigs.fasta".format(sample = sample)
+    else:
+        return "Contigs/Host_Depleted/Herpesvirus_DPOL/Present/{sample}_herpesvirus_dna_polymerase_contigs.fasta".format(sample = sample)
+
+# Rename polymerase contig .fasta file so that format is shared between 
+# samples with and without herpesvirus-like contigs.
+rule harmonize_herpesvirus_dpol_contig_filenames:
+    input:
+        get_dpol_contigs_file
+    output:
+        herpesvirus_dpol_contigs_file = "Contigs/Host_Depleted/Herpesvirus_DPOL/{sample}_herpesvirus_dna_polymerase_contigs.fasta"
+    threads: 1
+    shell:
+        "mv {input} {output}"

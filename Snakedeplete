@@ -1,0 +1,77 @@
+configfile: "config.yml"
+
+# Host depletion pipeline. Takes a set of reads and aligns them via Bowtie2 
+# against a reference genome specified in the config.yml (usually the 
+# mastomys coucha scaffold). Any reads mapping to the host genome are
+# filtered out. All unmapped reads are extracted and converted to .fastq
+# files for further processing.
+
+
+rule all:
+    input:
+        expand("Reads/Host_Depleted/{reference}/{sample}_host_depleted_R{num}.fq.gz", sample = config["all_samples"], num = [1,2], reference = config["host_reference"]),
+        expand("Reads/Host_Depleted/{reference}/{sample}_host_depleted_Singletons.fq.gz", sample = config["all_samples"], reference = config["host_reference"])
+
+
+# Map reads onto the host genome using Bowtie2
+# Genome .fasta and bowtie2 index are stored in the specified filepath
+rule bowtie_map_reads_onto_reference:
+    input:
+        reads_1 = "".join(["Reads/Deduplicated/{sample}_R1_dedup.", config["trimmed_reads_format"]]),
+        reads_2 = "".join(["Reads/Deduplicated/{sample}_R2_dedup.", config["trimmed_reads_format"]]),
+    output:
+        sam_file = "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}.sam"
+    params:
+        host_genome_index = config["host_sequence_index"]
+    threads: 8
+    shell:
+         "bowtie2 -x {params.host_genome_index} -1 {input.reads_1} -2 {input.reads_2} -S {output.sam_file} --threads {threads}" 
+
+
+# Compress .sam file.
+rule convert_sam_to_bam:
+    input:
+        "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}.sam"
+    output:
+        "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}.bam"
+    threads: 1
+    shell:
+        """
+        samtools view -S -b {input} | samtools sort -o {output}
+        samtools index {output}
+        rm -f {input}
+        """
+
+# Extract all reads with specified flag (f4 for mapped reads)
+rule extract_flagged_reads:
+    input:
+        "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}.bam"
+    output:
+        "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}_{sam_flag}.bam"
+    threads: 1
+    params:
+        temp_sam = "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}_{sam_flag}.sam"
+    shell:
+        """
+        samtools view -h -{wildcards.sam_flag} {input} > {params.temp_sam}
+        samtools view -S -b {params.temp_sam} | samtools sort -o {output}
+        samtools index {output}
+        rm -f {params.temp_sam}
+        """
+
+# Turn extracted .bam reads into .fastq files.
+# For read pairs where neither read was filtered out, reads are stored in
+# _R1 and _R2 files, as with normal paired-end libraries. Reads whose
+# pair-mate was filtered out are stored in the _Singletons file.
+# _Other is always empty, just output automatically by samtools fastq
+rule convert_unmapped_reads_to_fastq:
+    input:
+        "Alignments/Host_Depletion/{reference}/{sample}_dedup_onto_{reference}_f4.bam"
+    output:
+        "Reads/Host_Depleted/{reference}/{sample}_host_depleted_R1.fq.gz",
+        "Reads/Host_Depleted/{reference}/{sample}_host_depleted_R2.fq.gz",
+        "Reads/Host_Depleted/{reference}/{sample}_host_depleted_Singletons.fq.gz",
+        "Reads/Host_Depleted/{reference}/{sample}_host_depleted_Other.fq.gz"
+    threads: 1
+    shell:
+        "samtools fastq -n -1 {output[0]} -2 {output[1]} -s {output[2]} -0 {output[3]} {input}"
